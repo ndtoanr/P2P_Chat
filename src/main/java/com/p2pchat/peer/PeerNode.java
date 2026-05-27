@@ -7,6 +7,7 @@ import com.p2pchat.shared.*;
 
 import java.io.*;
 import java.net.*;
+import java.sql.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Consumer;
@@ -27,8 +28,14 @@ public class PeerNode {
     private OutputStream bootstrapOut;
     private Thread bootstrapListenerThread;
 
-    // Heartbeat
+    // Peer Server (P2P)
+    private ServerSocket peerServerSocket;
+    private int listeningPort = 0;
+    private Thread peerServerThread;
+
+    // Heartbeat & DB Sync
     private ScheduledExecutorService heartbeatScheduler;
+    private ScheduledExecutorService directDbSyncScheduler;
 
     // Peer list
     private final ConcurrentHashMap<String, JsonObject> onlinePeers = new ConcurrentHashMap<>();
@@ -78,11 +85,12 @@ public class PeerNode {
         this.bootstrapPort = serverPort;
 
         try {
+            startPeerServer();
             connectToBootstrap();
 
             // Gửi REGISTER
             String localIp = getLocalIp();
-            Message registerMsg = Message.createRegister(username, password, localIp, 0);
+            Message registerMsg = Message.createRegister(username, password, localIp, listeningPort);
             Protocol.sendMessage(bootstrapSocket, registerMsg);
 
             // Đọc response
@@ -100,8 +108,31 @@ public class PeerNode {
                 return false;
             }
         } catch (IOException e) {
-            if (onError != null) onError.accept("Không thể kết nối tới server: " + e.getMessage());
-            return false;
+            System.out.println("[Peer] Bootstrap Server connection failed. Attempting Direct Database Registration...");
+            try {
+                DatabaseManager.initialize();
+                if (DatabaseManager.registerUser(username, password)) {
+                    connected = false;
+                    String localIp = getLocalIp();
+                    DatabaseManager.registerPeer(username, localIp, listeningPort);
+                    DatabaseManager.updateUserStatus(username, Constants.STATUS_ONLINE);
+                    
+                    loadFriendsFromDB();
+                    loadOnlinePeersFromDB();
+                    loadGroupsFromDB();
+                    loadPendingFriendRequestsFromDB();
+                    startDirectDbPeerSync();
+
+                    if (onConnectionChanged != null) onConnectionChanged.accept(false);
+                    return true;
+                } else {
+                    if (onError != null) onError.accept("Đăng ký thất bại: Tên đăng nhập đã tồn tại.");
+                    return false;
+                }
+            } catch (Exception dbEx) {
+                if (onError != null) onError.accept("Không thể kết nối tới Server và Database: " + dbEx.getMessage());
+                return false;
+            }
         }
     }
 
@@ -114,10 +145,11 @@ public class PeerNode {
         this.bootstrapPort = serverPort;
 
         try {
+            startPeerServer();
             connectToBootstrap();
 
             String localIp = getLocalIp();
-            Message loginMsg = Message.createLogin(username, password, localIp, 0);
+            Message loginMsg = Message.createLogin(username, password, localIp, listeningPort);
             Protocol.sendMessage(bootstrapSocket, loginMsg);
 
             Message response = Protocol.readMessage(bootstrapSocket);
@@ -134,8 +166,31 @@ public class PeerNode {
                 return false;
             }
         } catch (IOException e) {
-            if (onError != null) onError.accept("Không thể kết nối tới server: " + e.getMessage());
-            return false;
+            System.out.println("[Peer] Bootstrap Server connection failed. Attempting Direct Database Authentication...");
+            try {
+                DatabaseManager.initialize();
+                if (DatabaseManager.authenticateUser(username, password)) {
+                    connected = false;
+                    String localIp = getLocalIp();
+                    DatabaseManager.registerPeer(username, localIp, listeningPort);
+                    DatabaseManager.updateUserStatus(username, Constants.STATUS_ONLINE);
+                    
+                    loadFriendsFromDB();
+                    loadOnlinePeersFromDB();
+                    loadGroupsFromDB();
+                    loadPendingFriendRequestsFromDB();
+                    startDirectDbPeerSync();
+
+                    if (onConnectionChanged != null) onConnectionChanged.accept(false);
+                    return true;
+                } else {
+                    if (onError != null) onError.accept("Đăng nhập thất bại: Sai tài khoản hoặc mật khẩu.");
+                    return false;
+                }
+            } catch (Exception dbEx) {
+                if (onError != null) onError.accept("Không thể kết nối tới Server và Database: " + dbEx.getMessage());
+                return false;
+            }
         }
     }
 
@@ -165,6 +220,17 @@ public class PeerNode {
         if (heartbeatScheduler != null) {
             heartbeatScheduler.shutdown();
         }
+        if (directDbSyncScheduler != null) {
+            directDbSyncScheduler.shutdown();
+        }
+
+        // Direct DB mode cleanup
+        try {
+            DatabaseManager.unregisterPeer(username);
+            DatabaseManager.updateUserStatus(username, Constants.STATUS_OFFLINE);
+        } catch (Exception ignored) {}
+
+        stopPeerServer();
         if (onConnectionChanged != null) onConnectionChanged.accept(false);
         System.out.println("[Peer] Disconnected");
     }
@@ -175,39 +241,43 @@ public class PeerNode {
      * Gửi tin nhắn trực tiếp - trả về Message đã gửi để GUI dùng đúng messageId
      */
     public Message sendDirectMessage(String to, String content) {
-        if (!connected) {
-            if (onError != null) onError.accept("Chưa kết nối tới server!");
-            return null;
-        }
-
         Message msg = Message.createDirectMessage(username, to, content);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
+        if (sendToPeerOrFallback(to, msg)) {
             return msg;
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Gửi tin nhắn thất bại: " + e.getMessage());
-            handleConnectionLost();
-            return null;
         }
+        return null;
     }
 
     /**
      * Gửi tin nhắn nhóm - trả về Message đã gửi
      */
     public Message sendGroupMessage(String groupId, String content) {
-        if (!connected) {
-            if (onError != null) onError.accept("Chưa kết nối tới server!");
-            return null;
-        }
-
         Message msg = Message.createGroupMessage(username, groupId, content);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-            return msg;
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Gửi tin nhắn nhóm thất bại: " + e.getMessage());
-            handleConnectionLost();
-            return null;
+        if (connected) {
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+                return msg;
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Gửi tin nhắn nhóm thất bại: " + e.getMessage());
+                handleConnectionLost();
+                return null;
+            }
+        } else {
+            try {
+                // Save directly to database
+                DatabaseManager.saveMessage(msg);
+                // Try sending P2P to all other online members of the group
+                List<String> members = DatabaseManager.getGroupMembers(groupId);
+                for (String member : members) {
+                    if (!member.equals(username)) {
+                        sendToPeerOrFallback(member, msg);
+                    }
+                }
+                return msg;
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Gửi tin nhắn nhóm thất bại: " + e.getMessage());
+                return null;
+            }
         }
     }
 
@@ -215,17 +285,35 @@ public class PeerNode {
      * Gửi một Message đã được tạo sẵn (có metadata reply/forward)
      */
     public boolean sendRawMessage(Message msg) {
-        if (!connected) {
-            if (onError != null) onError.accept("Chưa kết nối tới server!");
-            return false;
-        }
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-            return true;
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Gửi tin nhắn thất bại: " + e.getMessage());
-            handleConnectionLost();
-            return false;
+        // Thử gửi P2P nếu là tin nhắn trực tiếp
+        if (msg.getType().equals(Constants.TYPE_DIRECT_MSG)) {
+            return sendToPeerOrFallback(msg.getTo(), msg);
+        } else {
+            if (connected) {
+                try {
+                    Protocol.sendMessage(bootstrapOut, msg);
+                    return true;
+                } catch (IOException e) {
+                    if (onError != null) onError.accept("Gửi tin nhắn thất bại: " + e.getMessage());
+                    handleConnectionLost();
+                    return false;
+                }
+            } else {
+                try {
+                    DatabaseManager.saveMessage(msg);
+                    String groupId = msg.getTo();
+                    List<String> members = DatabaseManager.getGroupMembers(groupId);
+                    for (String member : members) {
+                        if (!member.equals(username)) {
+                            sendToPeerOrFallback(member, msg);
+                        }
+                    }
+                    return true;
+                } catch (Exception e) {
+                    if (onError != null) onError.accept("Gửi tin nhắn thất bại: " + e.getMessage());
+                    return false;
+                }
+            }
         }
     }
 
@@ -233,160 +321,481 @@ public class PeerNode {
      * Gửi typing indicator
      */
     public void sendTyping(String to, boolean isTyping) {
-        if (!connected) return;
         Message msg = Message.createTyping(username, to, isTyping);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            // Ignore typing errors
-        }
+        sendToPeerOrFallback(to, msg);
     }
 
     /**
      * Gửi read receipt
      */
     public void sendReadReceipt(String to, String messageId) {
-        if (!connected) return;
         Message msg = Message.createReadReceipt(username, to, messageId);
+        sendToPeerOrFallback(to, msg);
+    }
+
+    // ==================== P2P DIRECT CONNECTION ====================
+
+    /**
+     * Khởi tạo ServerSocket để lắng nghe kết nối P2P từ các peer khác
+     */
+    private void startPeerServer() {
         try {
-            Protocol.sendMessage(bootstrapOut, msg);
+            if (peerServerSocket == null || peerServerSocket.isClosed()) {
+                peerServerSocket = new ServerSocket(0); // Cổng ngẫu nhiên
+                listeningPort = peerServerSocket.getLocalPort();
+                
+                peerServerThread = new Thread(() -> {
+                    while (peerServerSocket != null && !peerServerSocket.isClosed()) {
+                        try {
+                            Socket peerSocket = peerServerSocket.accept();
+                            new Thread(() -> handleIncomingPeerConnection(peerSocket)).start();
+                        } catch (IOException e) {
+                            if (!peerServerSocket.isClosed()) {
+                                System.err.println("[Peer] Error accepting peer connection: " + e.getMessage());
+                            }
+                        }
+                    }
+                }, "PeerServerThread");
+                peerServerThread.setDaemon(true);
+                peerServerThread.start();
+                System.out.println("[Peer] PeerServer started on port " + listeningPort);
+            }
+        } catch (IOException e) {
+            System.err.println("[Peer] Failed to start PeerServer: " + e.getMessage());
+        }
+    }
+
+    private void stopPeerServer() {
+        try {
+            if (peerServerSocket != null && !peerServerSocket.isClosed()) {
+                peerServerSocket.close();
+            }
         } catch (IOException e) {
             // Ignore
+        }
+    }
+
+    private void handleIncomingPeerConnection(Socket peerSocket) {
+        try {
+            Message message = Protocol.readMessage(peerSocket);
+            System.out.println("[Peer] Received P2P Message: " + message.getType() + " from " + message.getFrom());
+            handleBootstrapMessage(message);
+        } catch (IOException e) {
+            System.err.println("[Peer] Error reading from peer socket: " + e.getMessage());
+        } finally {
+            try {
+                peerSocket.close();
+            } catch (IOException e) {
+                // Ignore
+            }
+        }
+    }
+
+    /**
+     * Gửi Message trực tiếp P2P nếu online, ngược lại Fallback gửi qua Server
+     */
+    private boolean sendToPeerOrFallback(String toUser, Message msg) {
+        JsonObject peerInfo = onlinePeers.get(toUser);
+        if (peerInfo != null) {
+            String ip = peerInfo.get("ip").getAsString();
+            int port = peerInfo.get("port").getAsInt();
+            boolean p2pSuccess = false;
+
+            // 1. Thử kết nối tới IP được báo cáo
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(ip, port), 2000); // Timeout 2s
+                Protocol.sendMessage(socket, msg);
+                System.out.println("[Peer] Sent P2P Message to " + toUser + " (" + ip + ":" + port + ")");
+                p2pSuccess = true;
+            } catch (IOException e) {
+                System.out.println("[Peer] P2P connection to " + toUser + " (" + ip + ":" + port + ") failed: " + e.getMessage());
+            }
+
+            // 2. Nếu thất bại và IP không phải 127.0.0.1, thử kết nối tới 127.0.0.1 (hỗ trợ test local trên cùng một máy)
+            if (!p2pSuccess && !ip.equals("127.0.0.1")) {
+                try (Socket socket = new Socket()) {
+                    socket.connect(new InetSocketAddress("127.0.0.1", port), 2000); // Timeout 2s
+                    Protocol.sendMessage(socket, msg);
+                    System.out.println("[Peer] Sent P2P Message to " + toUser + " (127.0.0.1:" + port + ") via Local Loopback");
+                    p2pSuccess = true;
+                } catch (IOException e) {
+                    System.out.println("[Peer] P2P loopback connection to " + toUser + " (127.0.0.1:" + port + ") failed too: " + e.getMessage());
+                }
+            }
+
+            if (p2pSuccess) {
+                return true;
+            }
+        } else {
+            System.out.println("[Peer] " + toUser + " is offline or unknown, sending via Server Relay");
+        }
+
+        // Fallback
+        if (!connected) {
+            try {
+                DatabaseManager.saveOfflineMessage(msg, toUser);
+                System.out.println("[Peer] Direct DB fallback: Saved offline message for " + toUser);
+                return true;
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Lưu tin nhắn offline thất bại: " + e.getMessage());
+                return false;
+            }
+        }
+        
+        try {
+            Protocol.sendMessage(bootstrapOut, msg);
+            return true;
+        } catch (IOException e) {
+            if (onError != null) onError.accept("Gửi tin nhắn thất bại (mất kết nối server): " + e.getMessage());
+            handleConnectionLost();
+            return false;
         }
     }
 
     // ==================== FRIEND OPERATIONS ====================
 
     public void sendFriendRequest(String toUser) {
-        if (!connected) return;
-        Message msg = Message.createFriendRequest(username, toUser);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Gửi lời mời kết bạn thất bại!");
+        if (connected) {
+            Message msg = Message.createFriendRequest(username, toUser);
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Gửi lời mời kết bạn thất bại!");
+            }
+        } else {
+            try {
+                boolean success = DatabaseManager.sendFriendRequest(username, toUser);
+                if (success) {
+                    System.out.println("[Peer] Direct DB friend request sent to: " + toUser);
+                    loadFriendsFromDB();
+                    loadPendingFriendRequestsFromDB();
+                    // Send callback triggers to GUI
+                    if (onFriendRequestListUpdated != null) {
+                        onFriendRequestListUpdated.accept(new Message(Constants.TYPE_FRIEND_REQUEST_LIST, "SERVER", username));
+                    }
+                    if (onFriendListUpdated != null) {
+                        onFriendListUpdated.accept(new Message(Constants.TYPE_FRIEND_LIST, "SERVER", username));
+                    }
+                } else {
+                    if (onError != null) onError.accept("Gửi lời mời kết bạn thất bại!");
+                }
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Gửi lời mời kết bạn thất bại: " + e.getMessage());
+            }
         }
     }
 
     public void acceptFriendRequest(String fromUser) {
-        if (!connected) return;
-        Message msg = Message.createFriendAccept(username, fromUser);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Chấp nhận lời mời thất bại!");
+        if (connected) {
+            Message msg = Message.createFriendAccept(username, fromUser);
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Chấp nhận lời mời thất bại!");
+            }
+        } else {
+            try {
+                boolean success = DatabaseManager.acceptFriendRequest(fromUser, username);
+                if (success) {
+                    System.out.println("[Peer] Direct DB friend request accepted from: " + fromUser);
+                    loadFriendsFromDB();
+                    loadPendingFriendRequestsFromDB();
+                    if (onFriendRequestListUpdated != null) {
+                        onFriendRequestListUpdated.accept(new Message(Constants.TYPE_FRIEND_REQUEST_LIST, "SERVER", username));
+                    }
+                    if (onFriendListUpdated != null) {
+                        onFriendListUpdated.accept(new Message(Constants.TYPE_FRIEND_LIST, "SERVER", username));
+                    }
+                } else {
+                    if (onError != null) onError.accept("Chấp nhận lời mời thất bại!");
+                }
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Chấp nhận lời mời thất bại: " + e.getMessage());
+            }
         }
     }
 
     public void rejectFriendRequest(String fromUser) {
-        if (!connected) return;
-        Message msg = Message.createFriendReject(username, fromUser);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Từ chối lời mời thất bại!");
+        if (connected) {
+            Message msg = Message.createFriendReject(username, fromUser);
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Từ chối lời mời thất bại!");
+            }
+        } else {
+            try {
+                boolean success = DatabaseManager.rejectFriendRequest(fromUser, username);
+                if (success) {
+                    System.out.println("[Peer] Direct DB friend request rejected from: " + fromUser);
+                    loadFriendsFromDB();
+                    loadPendingFriendRequestsFromDB();
+                    if (onFriendRequestListUpdated != null) {
+                        onFriendRequestListUpdated.accept(new Message(Constants.TYPE_FRIEND_REQUEST_LIST, "SERVER", username));
+                    }
+                } else {
+                    if (onError != null) onError.accept("Từ chối lời mời thất bại!");
+                }
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Từ chối lời mời thất bại: " + e.getMessage());
+            }
         }
     }
 
     public void searchUser(String query) {
-        if (!connected) return;
-        Message msg = Message.createSearchUser(username, query);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Tìm kiếm thất bại!");
+        if (connected) {
+            Message msg = Message.createSearchUser(username, query);
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Tìm kiếm thất bại!");
+            }
+        } else {
+            try {
+                List<String> results = DatabaseManager.searchUsers(query, username);
+                List<String> friendsList = DatabaseManager.getFriends(username);
+                List<String> sentRequests = DatabaseManager.getSentFriendRequests(username);
+                List<String> receivedRequests = DatabaseManager.getPendingFriendRequests(username);
+
+                Message response = new Message(Constants.TYPE_SEARCH_RESULT, "SERVER", username);
+                JsonArray usersArray = new JsonArray();
+                for (String user : results) {
+                    JsonObject userObj = new JsonObject();
+                    userObj.addProperty("username", user);
+                    userObj.addProperty("isFriend", friendsList.contains(user));
+                    userObj.addProperty("requestSent", sentRequests.contains(user));
+                    userObj.addProperty("requestReceived", receivedRequests.contains(user));
+                    userObj.addProperty("isOnline", isPeerOnlineInDb(user));
+                    usersArray.add(userObj);
+                }
+                response.getPayload().add("users", usersArray);
+                if (onSearchResultReceived != null) {
+                    onSearchResultReceived.accept(response);
+                }
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Tìm kiếm thất bại: " + e.getMessage());
+            }
         }
     }
 
     public void requestFriendList() {
-        if (!connected) return;
-        Message msg = new Message(Constants.TYPE_FRIEND_LIST, username, "SERVER");
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            // Ignore
+        if (connected) {
+            Message msg = new Message(Constants.TYPE_FRIEND_LIST, username, "SERVER");
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                // Ignore
+            }
+        } else {
+            loadFriendsFromDB();
+            loadPendingFriendRequestsFromDB();
+            if (onFriendListUpdated != null) {
+                onFriendListUpdated.accept(new Message(Constants.TYPE_FRIEND_LIST, "SERVER", username));
+            }
+            if (onFriendRequestListUpdated != null) {
+                onFriendRequestListUpdated.accept(new Message(Constants.TYPE_FRIEND_REQUEST_LIST, "SERVER", username));
+            }
         }
     }
 
     public void unfriend(String targetUser) {
-        if (!connected) return;
-        Message msg = Message.createFriendRemove(username, targetUser);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Hủy kết bạn thất bại!");
+        if (connected) {
+            Message msg = Message.createFriendRemove(username, targetUser);
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Hủy kết bạn thất bại!");
+            }
+        } else {
+            try {
+                if (DatabaseManager.deleteFriend(username, targetUser)) {
+                    loadFriendsFromDB();
+                    if (onFriendListUpdated != null) {
+                        onFriendListUpdated.accept(new Message(Constants.TYPE_FRIEND_LIST, "SERVER", username));
+                    }
+                } else {
+                    if (onError != null) onError.accept("Hủy kết bạn thất bại!");
+                }
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Hủy kết bạn thất bại: " + e.getMessage());
+            }
         }
     }
 
     // ==================== GROUP OPERATIONS ====================
 
     public void createGroup(String groupName) {
-        if (!connected) return;
-        Message msg = Message.createGroupCreate(username, groupName);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Tạo nhóm thất bại!");
+        if (connected) {
+            Message msg = Message.createGroupCreate(username, groupName);
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Tạo nhóm thất bại!");
+            }
+        } else {
+            try {
+                String groupId = DatabaseManager.createGroup(groupName, username);
+                if (groupId != null) {
+                    loadGroupsFromDB();
+                    if (onGroupListUpdated != null) {
+                        onGroupListUpdated.accept(new Message(Constants.TYPE_GROUP_LIST, "SERVER", username));
+                    }
+                } else {
+                    if (onError != null) onError.accept("Tạo nhóm thất bại!");
+                }
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Tạo nhóm thất bại: " + e.getMessage());
+            }
         }
     }
 
     public void createGroupWithMembers(String groupName, String[] members) {
-        if (!connected) return;
-        Message msg = Message.createGroupCreateWithMembers(username, groupName, members);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Tạo nhóm thất bại!");
+        if (connected) {
+            Message msg = Message.createGroupCreateWithMembers(username, groupName, members);
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Tạo nhóm thất bại!");
+            }
+        } else {
+            try {
+                String groupId = DatabaseManager.createGroup(groupName, username);
+                if (groupId != null) {
+                    for (String member : members) {
+                        if (!member.equals(username)) {
+                            DatabaseManager.addGroupMember(groupId, member, "MEMBER");
+                        }
+                    }
+                    loadGroupsFromDB();
+                    if (onGroupListUpdated != null) {
+                        onGroupListUpdated.accept(new Message(Constants.TYPE_GROUP_LIST, "SERVER", username));
+                    }
+                } else {
+                    if (onError != null) onError.accept("Tạo nhóm thất bại!");
+                }
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Tạo nhóm thất bại: " + e.getMessage());
+            }
         }
     }
 
     public void deleteGroup(String groupId) {
-        if (!connected) return;
-        Message msg = Message.createGroupDelete(username, groupId);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Xóa nhóm thất bại!");
+        if (connected) {
+            Message msg = Message.createGroupDelete(username, groupId);
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Xóa nhóm thất bại!");
+            }
+        } else {
+            try {
+                if (DatabaseManager.isGroupAdmin(groupId, username)) {
+                    if (DatabaseManager.deleteGroup(groupId)) {
+                        loadGroupsFromDB();
+                        if (onGroupListUpdated != null) {
+                            onGroupListUpdated.accept(new Message(Constants.TYPE_GROUP_LIST, "SERVER", username));
+                        }
+                    } else {
+                        if (onError != null) onError.accept("Xóa nhóm thất bại!");
+                    }
+                } else {
+                    if (onError != null) onError.accept("Chỉ trưởng nhóm mới có quyền xóa nhóm!");
+                }
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Xóa nhóm thất bại: " + e.getMessage());
+            }
         }
     }
 
     public void removeGroupMember(String groupId, String targetUser) {
-        if (!connected) return;
-        Message msg = Message.createGroupRemoveMember(username, groupId, targetUser);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Xóa thành viên thất bại!");
+        if (connected) {
+            Message msg = Message.createGroupRemoveMember(username, groupId, targetUser);
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Xóa thành viên thất bại!");
+            }
+        } else {
+            try {
+                if (DatabaseManager.isGroupAdmin(groupId, username)) {
+                    DatabaseManager.removeGroupMember(groupId, targetUser);
+                    requestGroupMembers(groupId);
+                } else {
+                    if (onError != null) onError.accept("Bạn không có quyền xóa thành viên!");
+                }
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Xóa thành viên thất bại: " + e.getMessage());
+            }
         }
     }
 
     public void requestGroupMembers(String groupId) {
-        if (!connected) return;
-        Message msg = new Message(Constants.TYPE_GROUP_MEMBERS, username, "SERVER");
-        msg.getPayload().addProperty("groupId", groupId);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Lấy danh sách thành viên thất bại!");
+        if (connected) {
+            Message msg = new Message(Constants.TYPE_GROUP_MEMBERS, username, "SERVER");
+            msg.getPayload().addProperty("groupId", groupId);
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Lấy danh sách thành viên thất bại!");
+            }
+        } else {
+            try {
+                List<String> members = DatabaseManager.getGroupMembers(groupId);
+                Message response = new Message(Constants.TYPE_GROUP_MEMBERS, "SERVER", username);
+                response.getPayload().addProperty("groupId", groupId);
+                JsonArray membersArray = new JsonArray();
+                for (String member : members) {
+                    membersArray.add(member);
+                }
+                response.getPayload().add("members", membersArray);
+                if (onGroupMembersReceived != null) {
+                    onGroupMembersReceived.accept(response);
+                }
+            } catch (Exception e) {
+                // Ignore
+            }
         }
     }
 
     public void joinGroup(String groupId) {
-        if (!connected) return;
-        Message msg = Message.createGroupJoin(username, groupId);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Tham gia nhóm thất bại!");
+        if (connected) {
+            Message msg = Message.createGroupJoin(username, groupId);
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Tham gia nhóm thất bại!");
+            }
+        } else {
+            try {
+                DatabaseManager.addGroupMember(groupId, username, "MEMBER");
+                loadGroupsFromDB();
+                if (onGroupListUpdated != null) {
+                    onGroupListUpdated.accept(new Message(Constants.TYPE_GROUP_LIST, "SERVER", username));
+                }
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Tham gia nhóm thất bại: " + e.getMessage());
+            }
         }
     }
 
     public void leaveGroup(String groupId) {
-        if (!connected) return;
-        Message msg = Message.createGroupLeave(username, groupId);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Rời nhóm thất bại!");
+        if (connected) {
+            Message msg = Message.createGroupLeave(username, groupId);
+            try {
+                Protocol.sendMessage(bootstrapOut, msg);
+            } catch (IOException e) {
+                if (onError != null) onError.accept("Rời nhóm thất bại!");
+            }
+        } else {
+            try {
+                DatabaseManager.removeGroupMember(groupId, username);
+                loadGroupsFromDB();
+                if (onGroupListUpdated != null) {
+                    onGroupListUpdated.accept(new Message(Constants.TYPE_GROUP_LIST, "SERVER", username));
+                }
+            } catch (Exception e) {
+                if (onError != null) onError.accept("Rời nhóm thất bại: " + e.getMessage());
+            }
         }
     }
 
@@ -395,12 +804,9 @@ public class PeerNode {
     // ==================== FILE TRANSFER ====================
 
     public void sendFileInit(String to, String fileName, long fileSize, String fileHash, String transferId) {
-        if (!connected) return;
         Message msg = Message.createFileInit(username, to, fileName, fileSize, fileHash, transferId);
-        try {
-            Protocol.sendMessage(bootstrapOut, msg);
-        } catch (IOException e) {
-            if (onError != null) onError.accept("Gửi file thất bại!");
+        if (!sendToPeerOrFallback(to, msg)) {
+            if (onError != null) onError.accept("Gửi yêu cầu chuyển file thất bại!");
         }
     }
 
@@ -586,6 +992,156 @@ public class PeerNode {
         connected = false;
         if (onConnectionChanged != null) onConnectionChanged.accept(false);
         if (onError != null) onError.accept("Mất kết nối tới server!");
+    }
+
+    // ==================== DIRECT DATABASE MODE HELPERS ====================
+
+    private void loadFriendsFromDB() {
+        friends.clear();
+        try {
+            List<String> friendUsernames = DatabaseManager.getFriends(username);
+            for (String friendName : friendUsernames) {
+                JsonObject friendObj = new JsonObject();
+                friendObj.addProperty("username", friendName);
+                boolean isOnline = isPeerOnlineInDb(friendName);
+                friendObj.addProperty("isOnline", isOnline);
+                friends.put(friendName, friendObj);
+            }
+        } catch (Exception e) {
+            System.err.println("[Peer] Error loading friends from DB: " + e.getMessage());
+        }
+    }
+
+    private void loadOnlinePeersFromDB() {
+        onlinePeers.clear();
+        String sql = "SELECT username, ip_address, tcp_port FROM peer_registry WHERE is_online = TRUE AND last_heartbeat >= CURRENT_TIMESTAMP - INTERVAL 30 SECOND";
+        try (Connection conn = DatabaseManager.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+            ResultSet rs = stmt.executeQuery();
+            while (rs.next()) {
+                String peerName = rs.getString("username");
+                if (!peerName.equals(username)) {
+                    JsonObject peerObj = new JsonObject();
+                    peerObj.addProperty("username", peerName);
+                    peerObj.addProperty("ip", rs.getString("ip_address"));
+                    peerObj.addProperty("port", rs.getInt("tcp_port"));
+                    peerObj.addProperty("status", Constants.STATUS_ONLINE);
+                    onlinePeers.put(peerName, peerObj);
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("[Peer] Error loading online peers from DB: " + e.getMessage());
+        }
+    }
+
+    private boolean isPeerOnlineInDb(String peerUsername) {
+        String sql = "SELECT COUNT(*) FROM peer_registry WHERE username = ? AND is_online = TRUE AND last_heartbeat >= CURRENT_TIMESTAMP - INTERVAL 30 SECOND";
+        try (Connection conn = DatabaseManager.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setString(1, peerUsername);
+            ResultSet rs = stmt.executeQuery();
+            if (rs.next()) {
+                return rs.getInt(1) > 0;
+            }
+        } catch (SQLException e) {
+            // Ignore
+        }
+        return false;
+    }
+
+    private void loadGroupsFromDB() {
+        groups.clear();
+        try {
+            List<String[]> allGroups = DatabaseManager.getAllGroups();
+            List<String[]> userGroups = DatabaseManager.getUserGroups(username);
+            Set<String> joinedGroupIds = new HashSet<>();
+            for (String[] g : userGroups) {
+                joinedGroupIds.add(g[0]);
+            }
+            for (String[] group : allGroups) {
+                JsonObject groupObj = new JsonObject();
+                groupObj.addProperty("groupId", group[0]);
+                groupObj.addProperty("groupName", group[1]);
+                groupObj.addProperty("createdBy", group[2]);
+                groupObj.addProperty("joined", joinedGroupIds.contains(group[0]));
+                groups.put(group[0], groupObj);
+            }
+        } catch (Exception e) {
+            System.err.println("[Peer] Error loading groups from DB: " + e.getMessage());
+        }
+    }
+
+    private void loadPendingFriendRequestsFromDB() {
+        pendingFriendRequests.clear();
+        try {
+            List<String> pending = DatabaseManager.getPendingFriendRequests(username);
+            for (String requester : pending) {
+                JsonObject reqObj = new JsonObject();
+                reqObj.addProperty("username", requester);
+                reqObj.addProperty("isOnline", isPeerOnlineInDb(requester));
+                pendingFriendRequests.add(reqObj);
+            }
+        } catch (Exception e) {
+            System.err.println("[Peer] Error loading pending friend requests: " + e.getMessage());
+        }
+    }
+
+    private void fetchOfflineMessagesFromDb() {
+        try {
+            List<Message> offlineMsgs = DatabaseManager.getOfflineMessages(username);
+            if (offlineMsgs != null && !offlineMsgs.isEmpty()) {
+                System.out.println("[Peer] Fetched " + offlineMsgs.size() + " offline messages from DB");
+                for (Message msg : offlineMsgs) {
+                    msg.getPayload().addProperty("isOfflinePending", true);
+                    if (onMessageReceived != null) {
+                        onMessageReceived.accept(msg);
+                    } else {
+                        pendingMessages.offer(msg);
+                    }
+                }
+                DatabaseManager.deleteOfflineMessages(username);
+            }
+        } catch (Exception e) {
+            System.err.println("[Peer] Error fetching offline messages from DB: " + e.getMessage());
+        }
+    }
+
+    private void startDirectDbPeerSync() {
+        // Fetch offline messages immediately on login
+        fetchOfflineMessagesFromDb();
+        
+        directDbSyncScheduler = Executors.newSingleThreadScheduledExecutor();
+        directDbSyncScheduler.scheduleAtFixedRate(() -> {
+            try {
+                // Update heartbeat in DB
+                DatabaseManager.updateHeartbeat(username);
+                
+                // Fetch offline messages
+                fetchOfflineMessagesFromDb();
+                
+                // Reload collections
+                loadFriendsFromDB();
+                loadOnlinePeersFromDB();
+                loadGroupsFromDB();
+                loadPendingFriendRequestsFromDB();
+
+                // Notify UI components
+                if (onFriendListUpdated != null) {
+                    onFriendListUpdated.accept(new Message(Constants.TYPE_FRIEND_LIST, "SERVER", username));
+                }
+                if (onPeerStatusChanged != null) {
+                    onPeerStatusChanged.accept(new Message(Constants.TYPE_PEER_STATUS, "SERVER", username));
+                }
+                if (onGroupListUpdated != null) {
+                    onGroupListUpdated.accept(new Message(Constants.TYPE_GROUP_LIST, "SERVER", username));
+                }
+                if (onFriendRequestListUpdated != null) {
+                    onFriendRequestListUpdated.accept(new Message(Constants.TYPE_FRIEND_REQUEST_LIST, "SERVER", username));
+                }
+            } catch (Exception e) {
+                System.err.println("[Peer] Error in direct DB sync: " + e.getMessage());
+            }
+        }, 0, 5000, TimeUnit.MILLISECONDS);
     }
 
     // ==================== GETTERS ====================

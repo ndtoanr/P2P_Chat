@@ -446,14 +446,8 @@ public class ChatGUI extends JFrame {
         peerNode.setOnGroupMembersReceived(message -> SwingUtilities.invokeLater(() -> handleGroupMembersReceived(message)));
         peerNode.setOnReadReceiptReceived(message -> SwingUtilities.invokeLater(() -> handleReadReceipt(message)));
         peerNode.setOnConnectionChanged(connected -> SwingUtilities.invokeLater(() -> {
-            if (connected) {
-                connectionStatusLabel.setText("● Online");
-                connectionStatusLabel.setForeground(GREEN);
-            } else {
-                connectionStatusLabel.setText("● Offline");
-                connectionStatusLabel.setForeground(RED);
-                messageField.setEnabled(false);
-            }
+            connectionStatusLabel.setText("● Online");
+            connectionStatusLabel.setForeground(GREEN);
         }));
     }
 
@@ -495,9 +489,13 @@ public class ChatGUI extends JFrame {
                     try { DatabaseManager.markMessageRead(message.getMessageId()); } catch (Exception ignored) {}
                 } else {
                     // Tăng số tin nhắn chưa đọc và làm mới sidebar ngay lập tức
-                    unreadCounts.merge(from, 1, Integer::sum);
+                    boolean isOfflinePending = message.getPayloadBoolean("isOfflinePending");
+                    System.out.println("[DEBUG] handleReceivedMessage DIRECT_MSG: from=" + from + " isOfflinePending=" + isOfflinePending);
+                    if (!isOfflinePending) {
+                        unreadCounts.merge(from, 1, Integer::sum);
+                        showNotification("Tin nhắn mới từ " + from, ACCENT);
+                    }
                     refreshContactList();
-                    showNotification("Tin nhắn mới từ " + from, ACCENT);
                 }
             }
             case Constants.TYPE_GROUP_MSG -> {
@@ -522,9 +520,13 @@ public class ChatGUI extends JFrame {
                     chatListPanel.repaint();
                     scrollToBottom();
                 } else {
+                    boolean isOfflinePending = message.getPayloadBoolean("isOfflinePending");
                     unreadCounts.merge(groupId, 1, Integer::sum);
+                    System.out.println("[DEBUG] handleReceivedMessage GROUP_MSG: groupId=" + groupId + " from=" + from + " isOfflinePending=" + isOfflinePending + " newUnread=" + unreadCounts.get(groupId));
                     refreshGroupList();
-                    showNotification("Tin nhắn nhóm mới", TEAL);
+                    if (!isOfflinePending) {
+                        showNotification("Tin nhắn nhóm mới", TEAL);
+                    }
                 }
             }
             case Constants.TYPE_GROUP_CREATE_RESPONSE -> {
@@ -727,13 +729,13 @@ public class ChatGUI extends JFrame {
     private void forwardMessageTo(String target, boolean isGroup, String groupId, String content) {
         Message sentMsg;
         if (isGroup) {
-            sentMsg = peerNode.sendGroupMessage(groupId, content);
+            sentMsg = Message.createGroupMessage(peerNode.getUsername(), groupId, content);
         } else {
-            sentMsg = peerNode.sendDirectMessage(target, content);
+            sentMsg = Message.createDirectMessage(peerNode.getUsername(), target, content);
         }
-        if (sentMsg == null) return;
-
         sentMsg.getPayload().addProperty("isForwarded", true);
+
+        if (!peerNode.sendRawMessage(sentMsg)) return;
 
         if (isGroup) {
             addMessageToGroupHistory(groupId, sentMsg);
@@ -1119,14 +1121,12 @@ public class ChatGUI extends JFrame {
     // ==================== CONTACT & GROUP LIST ====================
 
     private void refreshContactList() {
-        contactListPanel.removeAll();
-
         if (isSearchMode) {
             // Search mode - hiện search results
-            contactListPanel.revalidate();
-            contactListPanel.repaint();
             return;
         }
+
+        contactListPanel.removeAll();
 
         // Hiện pending friend requests
         List<JsonObject> pending = peerNode.getPendingFriendRequests();
@@ -1744,6 +1744,62 @@ public class ChatGUI extends JFrame {
                     addBtn.addActionListener(e -> { peerNode.sendFriendRequest(name); peerNode.searchUser(searchField.getText().trim()); });
                     item.add(addBtn, BorderLayout.EAST);
                 }
+                contactListPanel.add(item);
+            }
+        }
+        contactListPanel.revalidate();
+        contactListPanel.repaint();
+    }
+
+    private void performLocalSearch(String query) {
+        isSearchMode = true;
+        contactListPanel.removeAll();
+        Map<String, JsonObject> friendMap = peerNode.getFriends();
+        List<String> matchedFriends = new ArrayList<>();
+        String lowerQuery = query.toLowerCase();
+        for (String friend : friendMap.keySet()) {
+            if (friend.toLowerCase().contains(lowerQuery)) {
+                matchedFriends.add(friend);
+            }
+        }
+
+        if (matchedFriends.isEmpty()) {
+            JLabel noResult = new JLabel("Không tìm thấy bạn bè");
+            noResult.setFont(new Font("Segoe UI", Font.ITALIC, 13));
+            noResult.setForeground(TEXT_MUTED);
+            noResult.setBorder(new EmptyBorder(20, 20, 20, 20));
+            contactListPanel.add(noResult);
+        } else {
+            JLabel header = new JLabel("  Kết quả tìm kiếm — " + matchedFriends.size());
+            header.setFont(new Font("Segoe UI", Font.BOLD, 11));
+            header.setForeground(ACCENT);
+            header.setBorder(new EmptyBorder(10, 12, 6, 12));
+            header.setMaximumSize(new Dimension(Integer.MAX_VALUE, 30));
+            contactListPanel.add(header);
+
+            for (String name : matchedFriends) {
+                JPanel item = new JPanel(new BorderLayout());
+                item.setBackground(BG_SIDEBAR);
+                item.setMaximumSize(new Dimension(Integer.MAX_VALUE, 52));
+                item.setBorder(new EmptyBorder(6, 16, 6, 16));
+
+                JLabel avatar = UIHelper.createAvatar(name, 34);
+                JLabel nameLabel = new JLabel(name);
+                nameLabel.setFont(new Font("Segoe UI", Font.PLAIN, 14));
+                nameLabel.setForeground(TEXT_PRIMARY);
+                nameLabel.setBorder(new EmptyBorder(0, 10, 0, 0));
+
+                item.add(avatar, BorderLayout.WEST);
+                item.add(nameLabel, BorderLayout.CENTER);
+
+                JButton chatNowBtn = UIHelper.createSmallButton("Chat ngay", GREEN);
+                chatNowBtn.addActionListener(e -> {
+                    openChat(name, false, null);
+                    isSearchMode = false;
+                    searchField.setText("");
+                    refreshContactList();
+                });
+                item.add(chatNowBtn, BorderLayout.EAST);
                 contactListPanel.add(item);
             }
         }

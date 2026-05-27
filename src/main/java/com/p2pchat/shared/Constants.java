@@ -8,11 +8,11 @@ public final class Constants {
     private Constants() {} // Prevent instantiation
 
     // ==================== SERVER CONFIG ====================
-    public static final String BOOTSTRAP_HOST = "192.168.66.183";
+    public static final String BOOTSTRAP_HOST = " 172.20.10.2";
     public static final int BOOTSTRAP_PORT = 9000;
 
     // ==================== DATABASE CONFIG ====================
-    public static final String DB_URL = "jdbc:mysql://192.168.66.183:3306/p2p_chat?useSSL=false&serverTimezone=Asia/Ho_Chi_Minh&allowPublicKeyRetrieval=true&characterEncoding=UTF-8";
+    public static final String DB_URL = "jdbc:mysql:// 172.20.10.2:3306/p2p_chat?useSSL=false&serverTimezone=Asia/Ho_Chi_Minh&allowPublicKeyRetrieval=true&characterEncoding=UTF-8";
     public static final String DB_USER = "root";
     public static final String DB_PASSWORD = "123456";
     public static final int DB_POOL_SIZE = 10;

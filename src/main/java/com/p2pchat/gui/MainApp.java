@@ -53,7 +53,7 @@ public class MainApp {
             LoginDialog loginDialog = new LoginDialog(null, peerNode);
             loginDialog.setVisible(true);
 
-            if (peerNode.isConnected()) {
+            if (peerNode.getUsername() != null) {
                 ChatGUI chatGUI = new ChatGUI(peerNode);
                 chatGUI.setVisible(true);
             } else {

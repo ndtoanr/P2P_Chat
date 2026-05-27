@@ -561,6 +561,7 @@ public class ClientHandler implements Runnable {
         if (!offlineMessages.isEmpty()) {
             System.out.println("[Handler] Sending " + offlineMessages.size() + " offline messages to " + user);
             for (Message msg : offlineMessages) {
+                msg.getPayload().addProperty("isOfflinePending", true);
                 peerRegistry.sendToPeer(user, msg);
             }
             DatabaseManager.deleteOfflineMessages(user);
