@@ -46,7 +46,7 @@ P2P_Chat/
 ├── pom.xml                     # Tệp cấu hình thư viện và quy trình Build của Maven
 ├── build.bat                   # Script tự động tải thư viện, dọn dẹp và đóng gói Fat JAR
 ├── run_server.bat              # Script khởi động nhanh máy chủ (Bootstrap Server)
-└── run_client.bat              # Script khởi động nhanh ứng dụng nhắn tin (Client)
+└── run_client.bat              # Script khởi động nhanh ứng dụng nhắn tin cho các Peer
 ```
 
 ---
@@ -94,7 +94,7 @@ Bootstrap Server cần được chạy trước để mở cổng lắng nghe đ
 - Nhấp đúp chuột vào file `run_server.bat`.
 - **Hoặc** khởi chạy thủ công qua dòng lệnh Terminal:
   ```cmd
-  java -cp target/p2p-chat-1.0-SNAPSHOT.jar;lib/* com.p2pchat.server.BootstrapServer
+  run_server.bat
   ```
 
 ### Bước 5: Khởi chạy Peer (Ứng dụng Chat)
@@ -102,7 +102,7 @@ Sau khi Server đã chạy thành công, khởi động các máy trạm Chat Cl
 - Nhấp đúp chuột vào file `run_client.bat`.
 - **Hoặc** khởi chạy thủ công qua dòng lệnh Terminal:
   ```cmd
-  java -cp target/p2p-chat-1.0-SNAPSHOT.jar;lib/* com.p2pchat.gui.MainApp
+  run_client.bat
   ```
 
 ---
